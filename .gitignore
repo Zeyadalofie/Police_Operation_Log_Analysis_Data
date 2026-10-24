@@ -10,3 +10,7 @@ wheels/
 .venv
 
 .env
+frontend/node_modules/
+frontend/dist/
+*.sqlite3
+__pycache__/
