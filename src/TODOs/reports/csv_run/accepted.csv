@@ -1,0 +1,6 @@
+id,category,status,minutes
+SIM-001,assistance,closed,20
+SIM-002,traffic,open,35
+SIM-003,property,closed,15
+SIM-004,assistance,open,0
+SIM-005,traffic,closed,50

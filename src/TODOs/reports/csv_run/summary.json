@@ -1,0 +1,16 @@
+{
+  "dataset": "synthetic_training_only",
+  "accepted_count": 5,
+  "rejected_count": 3,
+  "total_minutes": 120,
+  "mean_minutes": 24.0,
+  "by_status": {
+    "open": 2,
+    "closed": 3
+  },
+  "by_category": {
+    "assistance": 2,
+    "traffic": 2,
+    "property": 1
+  }
+}

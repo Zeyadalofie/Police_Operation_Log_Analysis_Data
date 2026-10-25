@@ -501,7 +501,7 @@ wheels = [
 [[package]]
 name = "police-operations-log-data-analysis"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "authlib" },
     { name = "boto3" },

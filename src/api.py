@@ -19,7 +19,7 @@ from .connection import ai_config_for_user, public_connection_details
 from .storage import drive_file_metadata, s3_report_key
 from .upload import read_dataset, summarize
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 try:
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
@@ -422,4 +422,4 @@ async def save_cloud(request:Request):
 
 def run():
     import uvicorn
-    uvicorn.run("police_operations_log_data_analysis.api:app",host="127.0.0.1",port=8000,reload=True)
+    uvicorn.run("src.api:app",host="127.0.0.1",port=8000,reload=True)

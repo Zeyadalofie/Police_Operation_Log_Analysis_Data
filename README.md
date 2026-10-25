@@ -1,27 +1,73 @@
-# مرصد — تحليل العمليات
+# Mirsad — Operations Data Analysis Dashboard
 
-تطبيق عربي محلي لتحليل ملفات CSV وJSON. يتكون من واجهة React/Vite وخادم Python/FastAPI. لكل مستخدم حساب وبيانات واتصالات مستقلة.
+Mirsad is a locally run data analysis dashboard for operations data. It combines a React and Vite frontend with a Python and FastAPI backend, and keeps each user's account, data, and integrations separate.
 
-## التشغيل على Windows باستخدام uv
+## Features
 
-1. افتح نافذتي PowerShell في مجلد المشروع.
-2. ثبّت متطلبات Python: `uv sync`
-3. شغّل الخادم في النافذة الأولى: `uv run uvicorn police_operations_log_data_analysis.api:app --reload --host 127.0.0.1 --port 8000`
-4. شغّل الواجهة في النافذة الثانية: `cd frontend` ثم `npm.cmd install` (أول مرة فقط)، ثم `npm.cmd run dev`.
-5. افتح العنوان الذي يعرضه Vite، غالباً `http://127.0.0.1:5173`.
+- Upload and preview CSV and JSON datasets (up to 15 MB).
+- Review dataset dimensions, missing values, and summary statistics.
+- Create bar and pie charts from selected dataset columns.
+- Configure an AI provider per user, including local Ollama and OpenAI-compatible APIs. The chart assistant sends aggregated statistics to the model, not the raw dataset rows.
+- Connect Google Drive or S3-compatible storage and choose where to save reports.
+- Sign in with email and password, with optional Google and Apple OAuth configuration.
 
-إذا منع PowerShell تشغيل `npm.ps1` استخدم `npm.cmd` كما في الأوامر أعلاه. إذا كان القرص ممتلئاً، حرر مساحة قبل التثبيت.
+## Requirements
 
-## الوظائف
+- Python 3.10 or later
+- [uv](https://docs.astral.sh/uv/)
+- Node.js and npm
 
-- التسجيل والدخول بالبريد وكلمة المرور، وجلسة خاصة لكل حساب.
-- رفع CSV وJSON فقط، بحد أقصى 15 ميجابايت، مع معاينة وحساب القيم المفقودة والملخصات.
-- مساعد مخصص لإنشاء رسم أعمدة أو رسم دائري من أعمدة الملف. يرسل للخادم القيم المجمعة فقط إلى نموذج الذكاء الاصطناعي لاختيار عنوان الرسم؛ لا يرسل صفوف الملف للنموذج.
-- إعداد مستقل لكل حساب لـ Ollama محلي أو OpenAI أو واجهة متوافقة مع OpenAI.
-- إعداد ربط Google Drive وS3-compatible لكل مستخدم، واختيار وجهة حفظ الملف.
+## Run locally on Windows
 
-## إعداد الأمان
+Open two PowerShell terminals in the project root.
 
-لا تضع الأسرار في الشيفرة ولا ترفع `.env` إلى Git. يلزم أن يحتوي `.env` على `SESSION_SECRET` و`CREDENTIALS_ENCRYPTION_KEY` بقيم قوية، وإعدادات OAuth عند تفعيل تسجيل Google أو ربط Google Drive. استخدم رابط callback التالي في Google Cloud: `http://localhost:8000/api/connections/google-drive/callback`.
+### 1. Install Python dependencies
 
-التطبيق محلي للتطوير. قبل نشره على الإنترنت، استخدم HTTPS، وقاعدة بيانات مُدارة، وحماية CSRF وتحديد محاولات الدخول، وإعدادات OAuth إنتاجية. زر Google Drive يحتاج إعداد Google OAuth مرة واحدة في الخادم، ثم يربط كل مستخدم حسابه من داخل التطبيق.
+```powershell
+uv sync
+```
+
+### 2. Start the backend
+
+In the first terminal, run:
+
+```powershell
+uv run python -m uvicorn src.api:app --reload --host 127.0.0.1 --port 8000
+```
+
+### 3. Start the frontend
+
+In the second terminal, run:
+
+```powershell
+cd frontend
+npm.cmd install
+npm.cmd run dev
+```
+
+Run `npm.cmd install` once, or again after frontend dependencies change. Open the local URL printed by Vite, usually `http://localhost:5173`.
+
+Use `npm.cmd` in PowerShell if its execution policy blocks `npm.ps1`.
+
+## Configuration
+
+Keep credentials in the local `.env` file; never put secrets in source code or commit `.env` to Git. Set strong values for `SESSION_SECRET` and `CREDENTIALS_ENCRYPTION_KEY`. Add OAuth credentials only when enabling the corresponding sign-in or storage integration.
+
+For a Google OAuth web client used locally, register these authorized redirect URIs:
+
+```text
+http://localhost:8000/api/auth/google/callback
+http://localhost:8000/api/connections/google-drive/callback
+```
+
+If needed, register this authorized JavaScript origin separately:
+
+```text
+http://localhost:5173
+```
+
+The Google Drive integration requires OAuth configuration on the backend. Each user then connects their own Google account from within the application.
+
+## Production deployment
+
+This repository is configured for local development. Before exposing it publicly, use HTTPS, a managed database, CSRF protection, login rate limits, and production OAuth settings. Review the deployment configuration and secret handling before launch.

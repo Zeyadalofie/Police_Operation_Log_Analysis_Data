@@ -1,0 +1,50 @@
+[
+  {
+    "id": "SIM-001",
+    "category": "assistance",
+    "status": "closed",
+    "minutes": "20"
+  },
+  {
+    "id": "SIM-002",
+    "category": "traffic",
+    "status": "open",
+    "minutes": "35"
+  },
+  {
+    "id": "SIM-003",
+    "category": "property",
+    "status": "closed",
+    "minutes": "15"
+  },
+  {
+    "id": "SIM-004",
+    "category": "assistance",
+    "status": "open",
+    "minutes": "0"
+  },
+  {
+    "id": "SIM-005",
+    "category": "traffic",
+    "status": "closed",
+    "minutes": "50"
+  },
+  {
+    "id": "SIM-006",
+    "category": "property",
+    "status": "pending",
+    "minutes": "10"
+  },
+  {
+    "id": "SIM-007",
+    "category": "traffic",
+    "status": "open",
+    "minutes": "-5"
+  },
+  {
+    "id": "SIM-008",
+    "category": "unknown",
+    "status": "closed",
+    "minutes": "12"
+  }
+]
