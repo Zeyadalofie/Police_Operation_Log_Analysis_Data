@@ -2,8 +2,17 @@
 import json
 from pathlib import Path
 
-def s3_report_key(user_id, filename):
-    return f"users/{user_id}/{Path(filename).name}"
+def s3_report_key(user_id, filename, prefix=""):
+    clean_parts = [
+        part.strip()
+        for part in str(prefix).replace("\\", "/").split("/")
+        if part.strip() and part.strip() not in (".", "..")
+    ]
+    return "/".join(["users", str(user_id), *clean_parts, Path(filename).name])
 
-def drive_file_metadata(filename):
-    return json.dumps({"name": Path(filename).name, "mimeType": "application/json"})
+
+def drive_file_metadata(filename, parent_id=None, mime_type="application/json"):
+    metadata = {"name": Path(filename).name, "mimeType": mime_type}
+    if parent_id:
+        metadata["parents"] = [parent_id]
+    return json.dumps(metadata)

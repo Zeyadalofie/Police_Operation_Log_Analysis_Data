@@ -3,21 +3,26 @@ from __future__ import annotations
 
 import hashlib, hmac, json, os, re, secrets, sqlite3
 from datetime import datetime, timezone
+from html import escape
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import httpx
+import pandas as pd
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 from authlib.integrations.starlette_client import OAuth
 from .connection import ai_config_for_user, public_connection_details
 from .storage import drive_file_metadata, s3_report_key
 from .upload import read_dataset, summarize
+from .TODOs.rules import CATEGORIES, FIELDS as OPERATION_FIELDS, process_records
 
 ROOT = Path(__file__).resolve().parents[1]
 try:
@@ -43,6 +48,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS social_accounts(provider TEXT NOT NULL, subject TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id), PRIMARY KEY(provider, subject));
         CREATE TABLE IF NOT EXISTS connections(user_id INTEGER PRIMARY KEY, ai TEXT, drive TEXT, s3 TEXT, active_storage TEXT DEFAULT 'local');
         CREATE TABLE IF NOT EXISTS reports(user_id INTEGER PRIMARY KEY, data TEXT NOT NULL, filename TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS storage_paths(user_id INTEGER PRIMARY KEY REFERENCES users(id), drive_path TEXT NOT NULL DEFAULT '', s3_prefix TEXT NOT NULL DEFAULT '');
         """)
 
 init_db()
@@ -88,6 +94,9 @@ class AIConfig(BaseModel): provider: str; base_url: str = ""; model: str; api_ke
 class S3Config(BaseModel): endpoint_url: str; bucket: str; region: str = "us-east-1"; access_key: str; secret_key: str
 class ActiveStorage(BaseModel): provider: str
 class ChartRequest(BaseModel): kind: str; category: str; metric: str = "count"; prompt: str = ""
+class GenerateDataRequest(BaseModel): prompt: str; category: str = "all"; count: int = Field(default=8, ge=1, le=50)
+class StoragePaths(BaseModel): drive_path: str = ""; s3_prefix: str = ""
+class CloudReportPayload(BaseModel): chart: dict[str, Any] | None = None; ai_summary: dict[str, Any] | None = None
 
 @app.get("/api/health")
 def health(): return {"ok": True, "service": "مرصد API"}
@@ -162,8 +171,21 @@ def save_report(user_id, filename, rows):
 
 @app.post("/api/data/upload")
 async def upload(request: Request, file: UploadFile=File(...)):
-    user=current_user(request); rows=read_dataset(file.filename or "",await file.read()); save_report(user["id"],file.filename or "data",rows)
-    return {"filename":file.filename,"summary":summarize(rows)}
+    user = current_user(request)
+    rows = read_dataset(file.filename or "", await file.read())
+    validation = None
+    rejected = []
+    if rows and all(isinstance(row, dict) and set(row) == OPERATION_FIELDS for row in rows):
+        processed = process_records(rows)
+        validation = processed["summary"]
+        rejected = processed["rejected"]
+        rows = processed["accepted"]
+    save_report(user["id"], file.filename or "data", rows)
+    result = {"filename": file.filename, "summary": summarize(rows)}
+    if validation is not None:
+        result["rule_summary"] = validation
+        result["rejected"] = rejected
+    return result
 
 @app.get("/api/data/current")
 def current_data(request: Request):
@@ -190,6 +212,131 @@ async def chart(body: ChartRequest,request: Request):
 
 def get_ai_config(uid):
     return ai_config_for_user(uid, db, open_secret)
+
+
+def impute_missing_minutes(records):
+    """Fill blank numeric minutes with the median of valid minutes, without an AI call."""
+    missing_indexes = []
+    valid_minutes = []
+
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        value = record.get("minutes")
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing_indexes.append(index)
+        elif type(value) is int and value >= 0:
+            valid_minutes.append(value)
+        elif isinstance(value, str):
+            clean_value = value.strip()
+            if (clean_value.isascii() and clean_value.isdecimal()
+                    and (len(clean_value) == 1 or not clean_value.startswith("0"))):
+                valid_minutes.append(int(clean_value))
+
+    if not missing_indexes:
+        return records, 0
+    if not valid_minutes:
+        raise HTTPException(422, "لا توجد قيم دقائق صالحة لحساب الوسيط وملء القيم الفارغة")
+
+    median_minutes = int(round(pd.Series(valid_minutes, dtype="int64").median()))
+    completed = list(records)
+    for index in missing_indexes:
+        completed[index] = {**records[index], "minutes": median_minutes}
+    return completed, len(missing_indexes)
+
+
+@app.post("/api/data/generate")
+async def generate_operation_data(body: GenerateDataRequest, request: Request):
+    user = current_user(request)
+    config = get_ai_config(user["id"])
+    if not config or config.get("provider") != "ollama":
+        raise HTTPException(409, "اربط Ollama المحلي من صفحة التكاملات أولاً")
+    if body.category != "all" and body.category not in CATEGORIES:
+        raise HTTPException(400, "اختر فئة من الفئات المسموحة")
+    prompt_text = body.prompt.strip()
+    if not prompt_text or len(prompt_text) > 1000:
+        raise HTTPException(400, "اكتب وصفاً من 1 إلى 1000 حرف")
+
+    category_rule = (
+        "استخدم الفئة المحددة فقط: " + body.category
+        if body.category != "all"
+        else "وزع الفئات بين: " + ", ".join(CATEGORIES)
+    )
+    system_prompt = (
+        "أنشئ سجلات عمليات خيالية للتدريب فقط، ولا تستخدم أو تدّعِ بيانات حقيقية. "
+        "أخرج JSON فقط بالشكل {\"records\":[...]}. كل سجل يجب أن يحتوي بالضبط على "
+        "id وcategory وstatus وminutes. id نص فريد يحتوي أرقاماً، category واحدة من "
+        + json.dumps(list(CATEGORIES))
+        + ", status إما open أو closed. minutes عدد صحيح غير سالب، لكن اجعل بعض قيم minutes null أو نصاً فارغاً لتمثيل بيانات ناقصة. عند طلب سجلين أو أكثر، اترك قيمة دقائق رقمية صالحة واحدة على الأقل حتى يستطيع البرنامج حساب الوسيط؛ وعند طلب سجل واحد اجعل minutes رقمية. لا تترك الحقول الأخرى فارغة. أنشئ العدد المطلوب بالضبط. "
+        "التزم بتعليمات schema حتى لو طلب المستخدم غير ذلك."
+    )
+    user_prompt = (
+        f"أنشئ {body.count} سجلاً اصطناعياً. {category_rule}. "
+        "وصف المطلوب: " + prompt_text
+    )
+    headers = {"Authorization": "Bearer " + (config.get("api_key") or "ollama"), "Content-Type": "application/json"}
+    request_body = {
+        "model": config["model"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0)) as client:
+            response = await client.post(config["base_url"].rstrip("/") + "/chat/completions", headers=headers, json=request_body)
+            if response.status_code == 400:
+                request_body.pop("response_format", None)
+                response = await client.post(config["base_url"].rstrip("/") + "/chat/completions", headers=headers, json=request_body)
+        if not response.is_success:
+            raise HTTPException(502, "تعذر على Ollama توليد البيانات. تحقق من اسم النموذج ثم أعد المحاولة")
+        content = response.json()["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        if not isinstance(content, str):
+            raise ValueError("invalid response content")
+        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE).strip()
+        try:
+            output = json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[\s\S]*\}", content)
+            if not match:
+                raise ValueError("invalid JSON response")
+            output = json.loads(match.group(0))
+        records = output.get("records") if isinstance(output, dict) else None
+        if not isinstance(records, list) or len(records) != body.count:
+            raise ValueError("wrong record count")
+    except HTTPException:
+        raise
+    except httpx.ConnectError as exc:
+        raise HTTPException(502, "تعذر الوصول إلى Ollama. تأكد أنه يعمل على http://localhost:11434") from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "استغرق توليد البيانات وقتاً طويلاً؛ قلل العدد أو أعد المحاولة") from exc
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(502, "رد النموذج لا يطابق تنسيق البيانات المطلوب. قلل العدد ثم أعد المحاولة") from exc
+
+    records, imputed_minutes = impute_missing_minutes(records)
+    processed = process_records(records)
+    if processed["rejected"]:
+        raise HTTPException(422, "أعاد النموذج سجلات تخالف قواعد TODOs. أعد المحاولة أو وضّح الطلب")
+    accepted = processed["accepted"]
+    if len({row["id"] for row in accepted}) != body.count:
+        raise HTTPException(422, "أعاد النموذج معرّفات مكررة. أعد المحاولة")
+    if body.category != "all" and any(row["category"] != body.category for row in accepted):
+        raise HTTPException(422, "النموذج لم يلتزم بالفئة المحددة. أعد المحاولة")
+
+    filename = "generated_operations_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + ".json"
+    save_report(user["id"], filename, accepted)
+    return {
+        "filename": filename,
+        "summary": summarize(accepted),
+        "rule_summary": processed["summary"],
+        "preview": accepted[:10],
+        "imputed_minutes": imputed_minutes,
+    }
 
 
 @app.post("/api/assistant/summary")
@@ -311,9 +458,13 @@ async def ai_summary(request: Request):
 
 @app.get("/api/connections")
 def get_connections(request: Request):
-    user=current_user(request)
-    with db() as c: row=c.execute("SELECT * FROM connections WHERE user_id=?",(user["id"],)).fetchone()
-    return public_connection_details(row, open_secret)
+    user = current_user(request)
+    with db() as c:
+        row = c.execute("SELECT * FROM connections WHERE user_id=?", (user["id"],)).fetchone()
+        paths = c.execute("SELECT drive_path,s3_prefix FROM storage_paths WHERE user_id=?", (user["id"],)).fetchone()
+    details = public_connection_details(row, open_secret)
+    details["storage_paths"] = dict(paths) if paths else {"drive_path": "", "s3_prefix": ""}
+    return details
 
 @app.put("/api/connections/ai")
 def put_ai(body: AIConfig,request: Request):
@@ -343,6 +494,27 @@ def delete_s3(request:Request):
     uid=current_user(request)["id"]
     with db() as c: c.execute("UPDATE connections SET s3=NULL,active_storage=CASE WHEN active_storage='s3' THEN 'local' ELSE active_storage END WHERE user_id=?",(uid,))
     return {"ok":True}
+
+def normalize_destination_path(value: str, label: str) -> str:
+    parts = [part.strip() for part in value.replace("\\", "/").split("/") if part.strip()]
+    if len(parts) > 8 or any(part in (".", "..") or len(part) > 80 for part in parts):
+        raise HTTPException(400, f"مسار {label} غير صالح")
+    return "/".join(parts)
+
+
+@app.put("/api/connections/storage-paths")
+def set_storage_paths(body: StoragePaths, request: Request):
+    uid = current_user(request)["id"]
+    drive_path = normalize_destination_path(body.drive_path, "Google Drive")
+    s3_prefix = normalize_destination_path(body.s3_prefix, "التخزين السحابي")
+    with db() as c:
+        c.execute(
+            "INSERT INTO storage_paths(user_id,drive_path,s3_prefix) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET drive_path=excluded.drive_path,s3_prefix=excluded.s3_prefix",
+            (uid, drive_path, s3_prefix),
+        )
+    return {"ok": True, "drive_path": drive_path, "s3_prefix": s3_prefix}
+
 
 @app.put("/api/connections/storage")
 def set_storage(body:ActiveStorage,request:Request):
@@ -378,6 +550,36 @@ async def drive_callback(request:Request,code:str|None=None,state:str|None=None,
         c.execute("UPDATE connections SET drive=? WHERE user_id=?",(seal(value),uid))
     return RedirectResponse((os.getenv("FRONTEND_URL","http://localhost:5173")+"/#settings?drive=connected"))
 
+async def ensure_drive_folder_path(client, token: str, folder_path: str) -> str:
+    parent_id = "root"
+    for name in [part.strip() for part in folder_path.split("/") if part.strip()]:
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+        query = (
+            f"'{parent_id}' in parents and name = '{escaped}' and "
+            "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        )
+        listed = await client.get(
+            "https://www.googleapis.com/drive/v3/files",
+            headers={"Authorization": "Bearer " + token},
+            params={"q": query, "fields": "files(id,name)", "pageSize": 100},
+        )
+        if not listed.is_success:
+            raise HTTPException(502, "تعذر البحث عن مجلد الوجهة في Google Drive")
+        folders = listed.json().get("files", [])
+        if folders:
+            parent_id = folders[0]["id"]
+            continue
+        created = await client.post(
+            "https://www.googleapis.com/drive/v3/files",
+            headers={"Authorization": "Bearer " + token},
+            json={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
+        )
+        if not created.is_success:
+            raise HTTPException(502, "تعذر إنشاء مجلد الوجهة في Google Drive")
+        parent_id = created.json()["id"]
+    return parent_id
+
+
 async def drive_access_token(creds):
     if creds.get("expires_at",0)>datetime.now(timezone.utc).timestamp()+60: return creds["access_token"],creds
     async with httpx.AsyncClient(timeout=25) as h:
@@ -393,31 +595,74 @@ def delete_drive(request:Request):
     with db() as c: c.execute("UPDATE connections SET drive=NULL,active_storage=CASE WHEN active_storage='google_drive' THEN 'local' ELSE active_storage END WHERE user_id=?",(uid,))
     return {"ok":True}
 
+def build_cloud_report_package(filename: str, rows: list[dict], chart: dict | None, ai_summary: dict | None) -> bytes:
+    chart_data = chart.get("data", []) if isinstance(chart, dict) else []
+    safe_chart_rows = [row for row in chart_data if isinstance(row, dict) and "name" in row and "value" in row]
+    max_value = max((float(row["value"]) for row in safe_chart_rows), default=0) or 1
+    chart_rows = "".join(
+        '<div class="bar-row"><span>' + escape(str(item["name"])) + '</span><div class="bar-track"><i style="width:'
+        + str(max(0, min(100, float(item["value"]) / max_value * 100))) + '%"></i></div><b>'
+        + escape(str(item["value"])) + '</b></div>'
+        for item in safe_chart_rows
+    ) or '<p class="muted">لا توجد بيانات رسم بياني محفوظة.</p>'
+
+    highlights = ai_summary.get("highlights", []) if isinstance(ai_summary, dict) else []
+    summary_cards = "".join(
+        '<article><h3>' + escape(str(item.get("column", ""))) + '</h3><p>'
+        + escape(str(item.get("reason", ""))) + '</p><small>القيم الفريدة: '
+        + escape(str(item.get("unique", "—"))) + ' · القيم الناقصة: '
+        + escape(str(item.get("missing", "—"))) + '</small></article>'
+        for item in highlights if isinstance(item, dict)
+    ) or '<p class="muted">لم يتوفر ملخص ذكاء اصطناعي لهذا التقرير.</p>'
+    summary_title = escape(str(ai_summary.get("title", "ملخص البيانات"))) if isinstance(ai_summary, dict) else "ملخص البيانات"
+    chart_title = escape(str(chart.get("title", "الرسم البياني"))) if isinstance(chart, dict) else "الرسم البياني"
+    exported_at = datetime.now(timezone.utc).isoformat()
+    html_report = f'''<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير مرصد</title>
+<style>body{{font-family:Arial,sans-serif;background:#f4f7fb;color:#243247;margin:0;padding:32px}}main{{max-width:1000px;margin:auto}}section{{background:white;border:1px solid #e5eaf1;border-radius:14px;padding:24px;margin:16px 0}}h1,h2,h3{{margin-top:0}}.muted,small{{color:#7d899a}}.bar-row{{display:grid;grid-template-columns:minmax(90px,180px) 1fr 70px;align-items:center;gap:12px;margin:12px 0}}.bar-track{{height:16px;background:#edf2fa;border-radius:9px;overflow:hidden}}.bar-track i{{display:block;height:100%;background:#276ef1;border-radius:9px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}}article{{border:1px solid #e8edf4;border-radius:10px;padding:16px}}table{{width:100%;border-collapse:collapse;display:block;overflow:auto}}td,th{{padding:9px;border-bottom:1px solid #edf0f4;text-align:right;white-space:nowrap}}@media(max-width:600px){{body{{padding:12px}}section{{padding:16px}}}}</style>
+<main><h1>تقرير تحليل البيانات</h1><p class="muted">الملف: {escape(Path(filename).name)} · وقت الحفظ: {escape(exported_at)}</p>
+<section><h2>{summary_title}</h2><div class="cards">{summary_cards}</div></section>
+<section><h2>{chart_title}</h2>{chart_rows}</section>
+<section><h2>معاينة البيانات</h2><p class="muted">الملف الكامل موجود في data.json داخل الحزمة.</p><table><thead><tr>{''.join('<th>'+escape(str(key))+'</th>' for key in (list(rows[0].keys()) if rows else []))}</tr></thead><tbody>{''.join('<tr>'+''.join('<td>'+escape(str(row.get(key, '')) )+'</td>' for key in rows[0].keys())+'</tr>' for row in rows[:100]) if rows else ''}</tbody></table></section></main></html>'''
+    package = BytesIO()
+    with ZipFile(package, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("data.json", json.dumps({"filename": Path(filename).name, "records": rows}, ensure_ascii=False, indent=2, default=str))
+        archive.writestr("analysis.json", json.dumps({"charts": [chart] if chart else [], "ai_summary": ai_summary}, ensure_ascii=False, indent=2, default=str))
+        archive.writestr("report.html", html_report)
+    return package.getvalue()
+
+
 @app.post("/api/data/save-cloud")
-async def save_cloud(request:Request):
+async def save_cloud(request:Request, body: CloudReportPayload = CloudReportPayload()):
     user=current_user(request)
     with db() as c:
-        con=c.execute("SELECT * FROM connections WHERE user_id=?",(user["id"],)).fetchone(); report=c.execute("SELECT filename,data FROM reports WHERE user_id=?",(user["id"],)).fetchone()
+        con=c.execute("SELECT * FROM connections WHERE user_id=?",(user["id"],)).fetchone()
+        report=c.execute("SELECT filename,data FROM reports WHERE user_id=?",(user["id"],)).fetchone()
+        paths=c.execute("SELECT drive_path,s3_prefix FROM storage_paths WHERE user_id=?",(user["id"],)).fetchone()
+    drive_path = paths["drive_path"] if paths else ""
+    s3_prefix = paths["s3_prefix"] if paths else ""
     if not report: raise HTTPException(400,"لا توجد بيانات لحفظها")
+    package_name = Path(report["filename"]).stem + "_analysis_report.zip"
+    package_data = build_cloud_report_package(report["filename"], json.loads(report["data"]), body.chart, body.ai_summary)
     if con["active_storage"]=="s3":
         cfg=open_secret(con["s3"])
         if not cfg: raise HTTPException(400,"اربط S3 أولاً")
         import boto3
         client=boto3.client("s3",endpoint_url=cfg["endpoint_url"] or None,region_name=cfg["region"],aws_access_key_id=cfg["access_key"],aws_secret_access_key=cfg["secret_key"])
-        key=s3_report_key(user["id"], report["filename"])
-        try: client.put_object(Bucket=cfg["bucket"],Key=key,Body=report["data"].encode(),ContentType="application/json")
+        key=s3_report_key(user["id"], package_name, s3_prefix)
+        try: client.put_object(Bucket=cfg["bucket"],Key=key,Body=package_data,ContentType="application/zip")
         except Exception as e: raise HTTPException(502,"فشل رفع الملف إلى S3: "+str(e)[:200])
-        return {"ok":True,"provider":"s3","key":key}
+        return {"ok":True,"provider":"s3","key":key,"filename":package_name,"destination":key}
     if con["active_storage"]=="google_drive":
         creds=open_secret(con["drive"])
         if not creds: raise HTTPException(400,"اربط Google Drive أولاً")
         token,creds=await drive_access_token(creds)
         with db() as c: c.execute("UPDATE connections SET drive=? WHERE user_id=?",(seal(creds),user["id"]))
-        metadata=drive_file_metadata(report["filename"])
         async with httpx.AsyncClient(timeout=45) as h:
-            res=await h.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name",headers={"Authorization":"Bearer "+token},files={"metadata":(None,metadata,"application/json"),"file":(Path(report["filename"]).name,report["data"],"application/json")})
+            parent_id = await ensure_drive_folder_path(h, token, drive_path) if drive_path else None
+            metadata=drive_file_metadata(package_name, parent_id, "application/zip")
+            res=await h.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,parents",headers={"Authorization":"Bearer "+token},files={"metadata":(None,metadata,"application/json"),"file":(package_name,package_data,"application/zip")})
         if not res.is_success: raise HTTPException(502,"فشل رفع الملف إلى Google Drive")
-        return {"ok":True,"provider":"google_drive",**res.json()}
+        return {"ok":True,"provider":"google_drive","filename":package_name,"destination":drive_path or "My Drive",**res.json()}
     raise HTTPException(400,"اختر Google Drive أو S3 كتخزين نشط")
 
 def run():

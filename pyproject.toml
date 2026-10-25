@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "itsdangerous>=2.2,<3",
     "boto3>=1.37,<2",
+    "pandas>=2.2,<4",
     "python-dotenv>=1,<2",
 ]
 

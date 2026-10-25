@@ -7,8 +7,9 @@ Mirsad is a locally run data analysis dashboard for operations data. It combines
 - Upload and preview CSV and JSON datasets (up to 15 MB).
 - Review dataset dimensions, missing values, and summary statistics.
 - Create bar and pie charts from selected dataset columns.
+- Generate synthetic operations datasets with a per-user local Ollama model; generated records are validated with the rules in `src/TODOs/rules.py`.
 - Configure an AI provider per user, including local Ollama and OpenAI-compatible APIs. The chart assistant sends aggregated statistics to the model, not the raw dataset rows.
-- Connect Google Drive or S3-compatible storage and choose where to save reports.
+- Connect Google Drive or S3-compatible storage, choose a per-user destination folder or prefix, and save reports there.
 - Sign in with email and password, with optional Google and Apple OAuth configuration.
 
 ## Requirements
